@@ -1,0 +1,606 @@
+// ================================================================
+//  SMART AUTOMATED BLIND SYSTEM — Arduino Mega 2560
+//  Tasks:
+//    Task 1 — Temperature triggered blind control (DHT11 + Motor)
+//    Task 2 — Humidity triggered blind & fan (DHT11 + Motor + Relay)
+//    Task 3 — IR remote manual override (HX1838 + Motor + Relay)
+//  Additional: DS3231 RTC scheduled automation
+//              HC-SR04 positional limit detection
+//              Serial commands to set schedule times
+// ================================================================
+
+#include <IRremote.h>
+#include <DHT.h>
+#include <RTClib.h>
+
+// ── Pin Definitions ──────────────────────────────────────────────
+#define IR_PIN        2       // HX1838 IR receiver
+#define STEP_PIN      3       // DRV8825 STEP
+#define DIR_PIN       4       // DRV8825 DIR
+#define EN_PIN        5       // DRV8825 ENABLE (active LOW)
+#define DHT_PIN       8       // DHT11 data pin
+#define RELAY_PIN     7       // Relay module (active LOW)
+#define TRIG_PIN      9       // HC-SR04 trigger
+#define ECHO_PIN      10      // HC-SR04 echo
+
+// ── DHT11 Setup ──────────────────────────────────────────────────
+#define DHT_TYPE      DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ── RTC Setup ────────────────────────────────────────────────────
+RTC_DS3231 rtc;
+
+// ── Motor Settings ───────────────────────────────────────────────
+#define OPEN_DIR      HIGH
+#define CLOSE_DIR     LOW
+#define MOTOR_ENABLE  LOW
+#define MOTOR_DISABLE HIGH
+
+int stepDelayUs = 3000;
+
+// ── Distance Thresholds (cm) ─────────────────────────────────────
+float openThreshold  = 30.0;  // fully open distance
+float closeThreshold = 4.0;   // fully closed distance
+
+// ── Temperature / Humidity Thresholds ───────────────────────────
+float tempOpenThreshold  = 28.0;
+float tempCloseThreshold = 22.0;
+float humidFanOn         = 70.0;
+float humidFanOff        = 55.0;
+
+// ── RTC Schedule ────────────────────────────────────────────────
+int scheduleOpenHour    = 7;   int scheduleOpenMin  = 0;
+int scheduleCloseHour   = 19;  int scheduleCloseMin = 0;
+
+// ── IR Button Codes (using .command field) ───────────────────────
+#define BTN_BLIND_OPEN    0x0C   // Blind OPEN
+#define BTN_BLIND_CLOSE   0x18   // Blind CLOSE
+#define BTN_FAN_ON        0x15   // Fan ON
+#define BTN_FAN_OFF       0x07   // Fan OFF
+#define BTN_AUTO_MODE     0x5E   // Switch back to AUTO mode
+
+// ── System State ─────────────────────────────────────────────────
+enum CurtainState { OPEN, CLOSED, OPENING, CLOSING };
+CurtainState curtainState = CLOSED;
+
+enum SystemMode { AUTO, MANUAL };
+SystemMode systemMode = AUTO;
+
+bool fanState     = false;
+bool rtcAvailable = false;
+
+// ── Timing ───────────────────────────────────────────────────────
+unsigned long lastDHTReadMs     = 0;
+unsigned long dhtIntervalMs     = 5000;
+unsigned long lastRTCCheckMs    = 0;
+unsigned long rtcIntervalMs     = 30000;
+unsigned long lastSerialPrintMs = 0;
+unsigned long serialIntervalMs  = 1000;
+unsigned long lastDistReadMs    = 0;
+unsigned long distIntervalMs    = 200;
+
+float lastTemp     = 0.0;
+float lastHum      = 0.0;
+float lastDistance  = 999.0;
+
+// Track if IR is currently paused
+bool irPaused = false;
+
+// ── Serial Input Buffer ─────────────────────────────────────────
+char serialBuffer[32];
+int  serialIndex = 0;
+
+// ================================================================
+//  SETUP
+// ================================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("==================================="));
+  Serial.println(F(" Smart Blind System — Mega 2560"));
+  Serial.println(F("==================================="));
+
+  // HC-SR04
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // DRV8825
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN,  OUTPUT);
+  pinMode(EN_PIN,   OUTPUT);
+  digitalWrite(STEP_PIN, LOW);
+  digitalWrite(EN_PIN, MOTOR_DISABLE);
+
+  // Relay (active LOW — HIGH = off at start)
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  // DHT11 (internal pull-up as backup)
+  pinMode(DHT_PIN, INPUT_PULLUP);
+  dht.begin();
+
+  // RTC DS3231
+  if (rtc.begin()) {
+    rtcAvailable = true;
+    if (rtc.lostPower()) {
+      Serial.println(F("RTC lost power — setting compile time"));
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    Serial.println(F("RTC initialised OK"));
+  } else {
+    Serial.println(F("WARNING: RTC not found — schedule disabled"));
+  }
+
+  // HX1838 IR Receiver
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+
+  // Do an initial DHT read before IR starts (clean, no conflicts)
+  delay(2000);
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t) && !isnan(h)) {
+    lastTemp = t;
+    lastHum  = h;
+    Serial.print(F("Initial Temp: ")); Serial.print(lastTemp); Serial.println(F(" C"));
+    Serial.print(F("Initial Hum:  ")); Serial.print(lastHum);  Serial.println(F(" %"));
+  } else {
+    Serial.println(F("WARNING: Initial DHT read failed"));
+  }
+
+  Serial.println(F("System ready. Mode: AUTO"));
+  Serial.println(F("-----------------------------------"));
+  printHelp();
+}
+
+// ================================================================
+//  MAIN LOOP
+// ================================================================
+void loop() {
+
+  // ── 1. Handle Serial Input ────────────────────────────────────
+  handleSerialInput();
+
+  // ── 2. Handle IR Remote ───────────────────────────────────────
+  handleIR();
+
+  // ── 3. Read DHT11 every 5 seconds ─────────────────────────────
+  if (millis() - lastDHTReadMs >= dhtIntervalMs) {
+    lastDHTReadMs = millis();
+    readDHT();
+  }
+
+  // ── 4. Read distance ONLY when motor is moving ─────────────────
+  if (curtainState == OPENING || curtainState == CLOSING) {
+    if (millis() - lastDistReadMs >= distIntervalMs) {
+      lastDistReadMs = millis();
+      lastDistance = readDistance();
+    }
+  }
+
+  // ── 5. Task 1 — Temperature Automation (AUTO mode only) ───────
+  if (systemMode == AUTO) {
+    handleTemperatureTask();
+  }
+
+  // ── 6. Task 2 — Humidity Fan Control (AUTO mode only) ────────
+  if (systemMode == AUTO) {
+    handleHumidityTask();
+  }
+
+  // ── 7. RTC Scheduled Automation (AUTO mode only) ─────────────
+  if (systemMode == AUTO && rtcAvailable) {
+    if (millis() - lastRTCCheckMs >= rtcIntervalMs) {
+      lastRTCCheckMs = millis();
+      handleRTCSchedule();
+    }
+  }
+
+  // ── 8. Drive Motor One Step ───────────────────────────────────
+  handleMotor(lastDistance);
+
+  // ── 9. Serial Debug Output ────────────────────────────────────
+  if (millis() - lastSerialPrintMs >= serialIntervalMs) {
+    lastSerialPrintMs = millis();
+    printStatus(lastDistance);
+  }
+}
+
+// ================================================================
+//  SERIAL INPUT HANDLER
+//  Commands (type in Serial Monitor, set to "Newline" or "Both NL & CR"):
+//    OPEN 7:30     — set blind open time to 7:30 AM
+//    CLOSE 19:00   — set blind close time to 7:00 PM
+//    SCHEDULE      — show current schedule
+//    HELP          — show available commands
+// ================================================================
+void handleSerialInput() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    // Enter key pressed — process the command
+    if (c == '\n' || c == '\r') {
+      if (serialIndex > 0) {
+        serialBuffer[serialIndex] = '\0';  // null terminate
+        processCommand(serialBuffer);
+        serialIndex = 0;                   // reset buffer
+      }
+    }
+    // Add character to buffer
+    else if (serialIndex < 30) {
+      serialBuffer[serialIndex] = c;
+      serialIndex++;
+    }
+  }
+}
+
+void processCommand(char* cmd) {
+  // Convert to uppercase for easier matching
+  for (int i = 0; cmd[i]; i++) {
+    if (cmd[i] >= 'a' && cmd[i] <= 'z') {
+      cmd[i] -= 32;
+    }
+  }
+
+  // ── OPEN HH:MM ──────────────────────────────────────────────
+  if (strncmp(cmd, "OPEN ", 5) == 0) {
+    int h = -1, m = -1;
+    if (parseTime(cmd + 5, &h, &m)) {
+      scheduleOpenHour = h;
+      scheduleOpenMin  = m;
+      Serial.print(F(">> Schedule OPEN time set to "));
+      printTime(h, m);
+      Serial.println();
+    } else {
+      Serial.println(F(">> Invalid format. Use: OPEN HH:MM (e.g. OPEN 7:30)"));
+    }
+  }
+
+  // ── CLOSE HH:MM ─────────────────────────────────────────────
+  else if (strncmp(cmd, "CLOSE ", 6) == 0) {
+    int h = -1, m = -1;
+    if (parseTime(cmd + 6, &h, &m)) {
+      scheduleCloseHour = h;
+      scheduleCloseMin  = m;
+      Serial.print(F(">> Schedule CLOSE time set to "));
+      printTime(h, m);
+      Serial.println();
+    } else {
+      Serial.println(F(">> Invalid format. Use: CLOSE HH:MM (e.g. CLOSE 19:00)"));
+    }
+  }
+
+  // ── SCHEDULE — show current schedule ─────────────────────────
+  else if (strncmp(cmd, "SCHEDULE", 8) == 0) {
+    Serial.println(F(">> Current schedule:"));
+    Serial.print(F(">>   OPEN  at "));
+    printTime(scheduleOpenHour, scheduleOpenMin);
+    Serial.println();
+    Serial.print(F(">>   CLOSE at "));
+    printTime(scheduleCloseHour, scheduleCloseMin);
+    Serial.println();
+  }
+
+  // ── HELP — show commands ─────────────────────────────────────
+  else if (strncmp(cmd, "HELP", 4) == 0) {
+    printHelp();
+  }
+
+  // ── Unknown command ──────────────────────────────────────────
+  else {
+    Serial.print(F(">> Unknown command: "));
+    Serial.println(cmd);
+    Serial.println(F(">> Type HELP for available commands"));
+  }
+}
+
+// Parse "HH:MM" string into hour and minute, returns true if valid
+bool parseTime(char* str, int* hour, int* minute) {
+  // Find the colon
+  char* colon = strchr(str, ':');
+  if (colon == NULL) return false;
+
+  // Split at colon
+  *colon = '\0';
+  int h = atoi(str);
+  int m = atoi(colon + 1);
+  *colon = ':';  // restore
+
+  // Validate range
+  if (h < 0 || h > 23 || m < 0 || m > 59) return false;
+
+  *hour   = h;
+  *minute = m;
+  return true;
+}
+
+// Print time in HH:MM format
+void printTime(int h, int m) {
+  if (h < 10) Serial.print(F("0"));
+  Serial.print(h);
+  Serial.print(F(":"));
+  if (m < 10) Serial.print(F("0"));
+  Serial.print(m);
+}
+
+// Print help message
+void printHelp() {
+  Serial.println(F("-----------------------------------"));
+  Serial.println(F(" SERIAL COMMANDS (type in Serial Monitor):"));
+  Serial.println(F("   OPEN 7:30    — set open time"));
+  Serial.println(F("   CLOSE 19:00  — set close time"));
+  Serial.println(F("   SCHEDULE     — show current schedule"));
+  Serial.println(F("   HELP         — show this message"));
+  Serial.println(F(" Set line ending to 'Newline' or 'Both NL & CR'"));
+  Serial.println(F("-----------------------------------"));
+}
+
+// ================================================================
+//  DHT READING — pauses IR, waits for clean window, reads, resumes
+// ================================================================
+void readDHT() {
+  IrReceiver.stop();
+  irPaused = true;
+  delay(100);
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  IrReceiver.start();
+  irPaused = false;
+
+  if (!isnan(t) && !isnan(h)) {
+    lastTemp = t;
+    lastHum  = h;
+  } else {
+    Serial.println(F("DHT: Read failed (keeping last values)"));
+  }
+}
+
+// ================================================================
+//  TASK 1 — Temperature Triggered Blind Control
+// ================================================================
+void handleTemperatureTask() {
+  if (lastTemp <= 0) return;
+
+  if (lastTemp > tempOpenThreshold && curtainState == CLOSED) {
+    curtainState = OPENING;
+    Serial.print(F("TASK1: Temp "));
+    Serial.print(lastTemp);
+    Serial.println(F("C > threshold -> OPENING"));
+  }
+  else if (lastTemp < tempCloseThreshold && curtainState == OPEN) {
+    curtainState = CLOSING;
+    Serial.print(F("TASK1: Temp "));
+    Serial.print(lastTemp);
+    Serial.println(F("C < threshold -> CLOSING"));
+  }
+}
+
+// ================================================================
+//  TASK 2 — Humidity Triggered Blind & Fan Control
+// ================================================================
+void handleHumidityTask() {
+  if (lastHum <= 0) return;
+
+  if (lastHum > humidFanOn && curtainState == OPEN) {
+    curtainState = CLOSING;
+    Serial.print(F("TASK2: Humidity "));
+    Serial.print(lastHum);
+    Serial.println(F("% > threshold -> CLOSING + FAN ON"));
+  }
+  else if (lastHum < humidFanOff && curtainState == CLOSED) {
+    if (lastTemp >= tempCloseThreshold && lastTemp <= tempOpenThreshold) {
+      curtainState = OPENING;
+      Serial.println(F("TASK2: Humidity normalised -> OPENING"));
+    }
+  }
+
+  if (lastHum > humidFanOn && !fanState) {
+    setFan(true);
+    Serial.println(F("TASK2: Fan ON"));
+  }
+  else if (lastHum < humidFanOff && fanState) {
+    setFan(false);
+    Serial.println(F("TASK2: Fan OFF"));
+  }
+}
+
+// ================================================================
+//  TASK 3 — IR Remote Manual Override
+//  MANUAL mode stays locked until AUTO button (0x5E) is pressed
+// ================================================================
+void handleIR() {
+  if (irPaused) return;
+  if (!IrReceiver.decode()) return;
+
+  uint16_t code = IrReceiver.decodedIRData.command;
+  IrReceiver.resume();
+
+  if (code == 0) return;
+
+  Serial.print(F("IR command: 0x"));
+  Serial.println(code, HEX);
+
+  if (code == BTN_AUTO_MODE) {
+    systemMode = AUTO;
+    Serial.println(F("TASK3: IR -> Mode: AUTO"));
+    return;
+  }
+
+  if (code == BTN_BLIND_OPEN) {
+    systemMode   = MANUAL;
+    curtainState = OPENING;
+    Serial.println(F("TASK3: IR -> Force OPEN | Mode: MANUAL"));
+  }
+  else if (code == BTN_BLIND_CLOSE) {
+    systemMode   = MANUAL;
+    curtainState = CLOSING;
+    Serial.println(F("TASK3: IR -> Force CLOSE | Mode: MANUAL"));
+  }
+  else if (code == BTN_FAN_ON) {
+    systemMode = MANUAL;
+    setFan(true);
+    Serial.println(F("TASK3: IR -> Force Fan ON | Mode: MANUAL"));
+  }
+  else if (code == BTN_FAN_OFF) {
+    systemMode = MANUAL;
+    setFan(false);
+    Serial.println(F("TASK3: IR -> Force Fan OFF | Mode: MANUAL"));
+  }
+}
+
+// ================================================================
+//  RTC SCHEDULED AUTOMATION
+// ================================================================
+void handleRTCSchedule() {
+  DateTime now = rtc.now();
+  int h = now.hour();
+  int m = now.minute();
+
+  if (h == scheduleOpenHour && m == scheduleOpenMin) {
+    if (curtainState == CLOSED) {
+      curtainState = OPENING;
+      Serial.println(F("RTC: Schedule -> OPENING"));
+    }
+  }
+
+  if (h == scheduleCloseHour && m == scheduleCloseMin) {
+    if (curtainState == OPEN) {
+      curtainState = CLOSING;
+      Serial.println(F("RTC: Schedule -> CLOSING"));
+    }
+  }
+}
+
+// ================================================================
+//  MOTOR DRIVER
+// ================================================================
+void handleMotor(float distance) {
+
+  if (curtainState == OPENING) {
+    enableMotor();
+    if (distance >= openThreshold) {
+      curtainState = OPEN;
+      stopMotor();
+      setFan(false);
+      Serial.println(F("MOTOR: Limit reached -> OPEN | Fan OFF"));
+    } else {
+      stepMotorOnce(OPEN_DIR);
+    }
+  }
+
+  else if (curtainState == CLOSING) {
+    enableMotor();
+    if (distance > 0 && distance < 500 && distance <= closeThreshold) {
+      curtainState = CLOSED;
+      stopMotor();
+      setFan(true);
+      Serial.println(F("MOTOR: Limit reached -> CLOSED | Fan ON"));
+    } else {
+      stepMotorOnce(CLOSE_DIR);
+    }
+  }
+
+  else {
+    disableMotor();
+  }
+}
+
+// ================================================================
+//  HC-SR04 DISTANCE READING
+// ================================================================
+float readDistance() {
+  IrReceiver.stop();
+  irPaused = true;
+  delay(2);
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 38000);
+
+  IrReceiver.start();
+  irPaused = false;
+
+  if (duration == 0) return 999.0;
+  return duration * 0.034 / 2.0;
+}
+
+// ================================================================
+//  MOTOR HELPERS
+// ================================================================
+void stepMotorOnce(bool dir) {
+  if (stepDelayUs < 2) stepDelayUs = 2;
+  digitalWrite(DIR_PIN, dir);
+  digitalWrite(STEP_PIN, HIGH);
+  delayMicroseconds(stepDelayUs);
+  digitalWrite(STEP_PIN, LOW);
+  delayMicroseconds(stepDelayUs);
+}
+
+void stopMotor() {
+  digitalWrite(STEP_PIN, LOW);
+  disableMotor();
+}
+
+void enableMotor()  { digitalWrite(EN_PIN, MOTOR_ENABLE);  }
+void disableMotor() { digitalWrite(EN_PIN, MOTOR_DISABLE); }
+
+// ================================================================
+//  FAN / RELAY HELPER
+// ================================================================
+void setFan(bool on) {
+  fanState = on;
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+}
+
+// ================================================================
+//  SERIAL STATUS PRINT
+// ================================================================
+void printStatus(float distance) {
+  Serial.println(F("-----------------------------------"));
+  Serial.print(F("Mode:     ")); Serial.println(systemMode == AUTO ? F("AUTO") : F("MANUAL"));
+  Serial.print(F("Blind:    ")); Serial.println(stateToText(curtainState));
+
+  Serial.print(F("Distance: "));
+  if (distance >= 999.0) {
+    Serial.println(F("No object detected"));
+  } else {
+    Serial.print(distance);
+    Serial.println(F(" cm"));
+  }
+
+  Serial.print(F("Temp:     ")); Serial.print(lastTemp);  Serial.println(F(" C"));
+  Serial.print(F("Humidity: ")); Serial.print(lastHum);   Serial.println(F(" %"));
+  Serial.print(F("Fan:      ")); Serial.println(fanState ? F("ON") : F("OFF"));
+
+  Serial.print(F("Schedule: Open "));
+  printTime(scheduleOpenHour, scheduleOpenMin);
+  Serial.print(F(" | Close "));
+  printTime(scheduleCloseHour, scheduleCloseMin);
+  Serial.println();
+
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    Serial.print(F("Time:     "));
+    Serial.print(now.hour());
+    Serial.print(F(":"));
+    if (now.minute() < 10) Serial.print(F("0"));
+    Serial.println(now.minute());
+  }
+}
+
+// ================================================================
+//  STATE TO TEXT HELPER
+// ================================================================
+const char* stateToText(CurtainState s) {
+  switch (s) {
+    case OPEN:    return "OPEN";
+    case CLOSED:  return "CLOSED";
+    case OPENING: return "OPENING";
+    case CLOSING: return "CLOSING";
+    default:      return "UNKNOWN";
+  }
+}
