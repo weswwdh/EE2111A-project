@@ -36,17 +36,18 @@ RTC_DS3231 rtc;
 #define MOTOR_ENABLE  LOW
 #define MOTOR_DISABLE HIGH
 
-int stepDelayUs = 3000;
+const int stepDelayUs = 3000;
 
 // ── Distance Thresholds (cm) ─────────────────────────────────────
-float openThreshold  = 30.0;  // fully open distance
-float closeThreshold = 4.0;   // fully closed distance
+const float openThreshold      = 30.0;  // fully open distance
+const float closeThreshold     = 4.0;   // fully closed distance
+const float maxValidDistanceCm = 500.0; // anything above is "no object"
 
 // ── Temperature / Humidity Thresholds ───────────────────────────
-float tempOpenThreshold  = 28.0;
-float tempCloseThreshold = 22.0;
-float humidFanOn         = 70.0;
-float humidFanOff        = 55.0;
+const float tempOpenThreshold  = 28.0;
+const float tempCloseThreshold = 22.0;
+const float humidFanOn         = 70.0;
+const float humidFanOff        = 55.0;
 
 // ── RTC Schedule ────────────────────────────────────────────────
 int scheduleOpenHour    = 7;   int scheduleOpenMin  = 0;
@@ -68,20 +69,22 @@ SystemMode systemMode = AUTO;
 
 bool fanState     = false;
 bool rtcAvailable = false;
+bool dhtValid     = false;   // becomes true after first successful DHT read
+bool motorEnabled = false;   // tracks DRV8825 ENABLE pin to skip redundant writes
 
 // ── Timing ───────────────────────────────────────────────────────
-unsigned long lastDHTReadMs     = 0;
-unsigned long dhtIntervalMs     = 5000;
-unsigned long lastRTCCheckMs    = 0;
-unsigned long rtcIntervalMs     = 30000;
-unsigned long lastSerialPrintMs = 0;
-unsigned long serialIntervalMs  = 1000;
-unsigned long lastDistReadMs    = 0;
-unsigned long distIntervalMs    = 200;
+unsigned long       lastDHTReadMs     = 0;
+const unsigned long dhtIntervalMs     = 5000;
+unsigned long       lastRTCCheckMs    = 0;
+const unsigned long rtcIntervalMs     = 30000;
+unsigned long       lastSerialPrintMs = 0;
+const unsigned long serialIntervalMs  = 1000;
+unsigned long       lastDistReadMs    = 0;
+const unsigned long distIntervalMs    = 200;
 
 float lastTemp     = 0.0;
 float lastHum      = 0.0;
-float lastDistance  = 999.0;
+float lastDistance = 999.0;
 
 // Track if IR is currently paused
 bool irPaused = false;
@@ -130,21 +133,23 @@ void setup() {
     Serial.println(F("WARNING: RTC not found — schedule disabled"));
   }
 
-  // HX1838 IR Receiver
-  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
-
-  // Do an initial DHT read before IR starts (clean, no conflicts)
+  // Do an initial DHT read BEFORE IR starts so the timer ISR can't
+  // disturb DHT11's bit-banged timing.
   delay(2000);
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   if (!isnan(t) && !isnan(h)) {
     lastTemp = t;
     lastHum  = h;
+    dhtValid = true;
     Serial.print(F("Initial Temp: ")); Serial.print(lastTemp); Serial.println(F(" C"));
     Serial.print(F("Initial Hum:  ")); Serial.print(lastHum);  Serial.println(F(" %"));
   } else {
     Serial.println(F("WARNING: Initial DHT read failed"));
   }
+
+  // HX1838 IR Receiver — start AFTER initial DHT read.
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
 
   Serial.println(F("System ready. Mode: AUTO"));
   Serial.println(F("-----------------------------------"));
@@ -269,7 +274,7 @@ void processCommand(char* cmd) {
   }
 
   // ── SCHEDULE — show current schedule ─────────────────────────
-  else if (strncmp(cmd, "SCHEDULE", 8) == 0) {
+  else if (strcmp(cmd, "SCHEDULE") == 0) {
     Serial.println(F(">> Current schedule:"));
     Serial.print(F(">>   OPEN  at "));
     printTime(scheduleOpenHour, scheduleOpenMin);
@@ -280,7 +285,7 @@ void processCommand(char* cmd) {
   }
 
   // ── HELP — show commands ─────────────────────────────────────
-  else if (strncmp(cmd, "HELP", 4) == 0) {
+  else if (strcmp(cmd, "HELP") == 0) {
     printHelp();
   }
 
@@ -350,6 +355,7 @@ void readDHT() {
   if (!isnan(t) && !isnan(h)) {
     lastTemp = t;
     lastHum  = h;
+    dhtValid = true;
   } else {
     Serial.println(F("DHT: Read failed (keeping last values)"));
   }
@@ -359,7 +365,7 @@ void readDHT() {
 //  TASK 1 — Temperature Triggered Blind Control
 // ================================================================
 void handleTemperatureTask() {
-  if (lastTemp <= 0) return;
+  if (!dhtValid) return;
 
   if (lastTemp > tempOpenThreshold && curtainState == CLOSED) {
     curtainState = OPENING;
@@ -379,7 +385,7 @@ void handleTemperatureTask() {
 //  TASK 2 — Humidity Triggered Blind & Fan Control
 // ================================================================
 void handleHumidityTask() {
-  if (lastHum <= 0) return;
+  if (!dhtValid) return;
 
   if (lastHum > humidFanOn && curtainState == OPEN) {
     curtainState = CLOSING;
@@ -411,6 +417,13 @@ void handleHumidityTask() {
 void handleIR() {
   if (irPaused) return;
   if (!IrReceiver.decode()) return;
+
+  // Ignore NEC "repeat" frames so holding a button down doesn't
+  // re-trigger the same action every ~110 ms.
+  if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) {
+    IrReceiver.resume();
+    return;
+  }
 
   uint16_t code = IrReceiver.decodedIRData.command;
   IrReceiver.resume();
@@ -475,6 +488,17 @@ void handleRTCSchedule() {
 //  MOTOR DRIVER
 // ================================================================
 void handleMotor(float distance) {
+  // Detect entry into a motion state and force a fresh distance sample
+  // so stale `lastDistance` (e.g. initial 999.0) can't trigger a false
+  // "limit reached" on the very first step.
+  static CurtainState prevMotorState = CLOSED;
+  if (curtainState != prevMotorState &&
+      (curtainState == OPENING || curtainState == CLOSING)) {
+    lastDistance   = readDistance();
+    lastDistReadMs = millis();
+    distance       = lastDistance;
+  }
+  prevMotorState = curtainState;
 
   if (curtainState == OPENING) {
     enableMotor();
@@ -490,7 +514,7 @@ void handleMotor(float distance) {
 
   else if (curtainState == CLOSING) {
     enableMotor();
-    if (distance > 0 && distance < 500 && distance <= closeThreshold) {
+    if (distance > 0 && distance < maxValidDistanceCm && distance <= closeThreshold) {
       curtainState = CLOSED;
       stopMotor();
       setFan(true);
@@ -545,8 +569,18 @@ void stopMotor() {
   disableMotor();
 }
 
-void enableMotor()  { digitalWrite(EN_PIN, MOTOR_ENABLE);  }
-void disableMotor() { digitalWrite(EN_PIN, MOTOR_DISABLE); }
+void enableMotor() {
+  if (!motorEnabled) {
+    digitalWrite(EN_PIN, MOTOR_ENABLE);
+    motorEnabled = true;
+  }
+}
+void disableMotor() {
+  if (motorEnabled) {
+    digitalWrite(EN_PIN, MOTOR_DISABLE);
+    motorEnabled = false;
+  }
+}
 
 // ================================================================
 //  FAN / RELAY HELPER
