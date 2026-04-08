@@ -505,8 +505,14 @@ void handleMotor(float distance) {
     if (distance >= openThreshold) {
       curtainState = OPEN;
       stopMotor();
-      setFan(false);
-      Serial.println(F("MOTOR: Limit reached -> OPEN | Fan OFF"));
+      // Fan coupling is a Task 2 AUTO-mode behaviour only; don't
+      // override a user's manual fan command when IR drove the motor.
+      if (systemMode == AUTO) {
+        setFan(false);
+        Serial.println(F("MOTOR: Limit reached -> OPEN | Fan OFF"));
+      } else {
+        Serial.println(F("MOTOR: Limit reached -> OPEN"));
+      }
     } else {
       stepMotorOnce(OPEN_DIR);
     }
@@ -517,8 +523,12 @@ void handleMotor(float distance) {
     if (distance > 0 && distance < maxValidDistanceCm && distance <= closeThreshold) {
       curtainState = CLOSED;
       stopMotor();
-      setFan(true);
-      Serial.println(F("MOTOR: Limit reached -> CLOSED | Fan ON"));
+      if (systemMode == AUTO) {
+        setFan(true);
+        Serial.println(F("MOTOR: Limit reached -> CLOSED | Fan ON"));
+      } else {
+        Serial.println(F("MOTOR: Limit reached -> CLOSED"));
+      }
     } else {
       stepMotorOnce(CLOSE_DIR);
     }
