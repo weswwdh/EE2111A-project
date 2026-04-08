@@ -566,7 +566,6 @@ float readDistance() {
 //  MOTOR HELPERS
 // ================================================================
 void stepMotorOnce(bool dir) {
-  if (stepDelayUs < 2) stepDelayUs = 2;
   digitalWrite(DIR_PIN, dir);
   digitalWrite(STEP_PIN, HIGH);
   delayMicroseconds(stepDelayUs);
